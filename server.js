@@ -1,11 +1,12 @@
 // =================================================================
-// ⚙️ استدعاء المكتبات الأساسية
+// ⚙️ استدعاء المكتبات الأساسية (شاملة الروبوت الآلي)
 // =================================================================
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
+const cron = require('node-cron'); // مكتبة الروبوت والمحاسب الآلي
 require('dotenv').config();
 
 // =================================================================
@@ -21,7 +22,7 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false } // ضروري للاستضافات السحابية
 });
 
-// المفتاح السري لتشفير التذاكر (في الإنتاج الحقيقي نضعه في ملف .env)
+// المفتاح السري لتشفير التذاكر
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_key_yemen_2026';
 
 // =================================================================
@@ -29,23 +30,21 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_key_yemen_2026';
 // =================================================================
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // جلب التذكرة
+    const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) {
         return res.status(401).json({ success: false, message: "⛔ الدخول مرفوض! لم تقم بإرفاق تذكرة الأمان (Token)." });
     }
 
-    // التحقق من صحة التذكرة
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) return res.status(403).json({ success: false, message: "❌ تذكرة الأمان غير صالحة أو منتهية الصلاحية." });
-        
-        req.user = user; // حفظ بيانات المستخدم الموثق لتمريرها للنافذة
-        next(); // السماح بالمرور
+        req.user = user; 
+        next(); 
     });
 };
 
 // =================================================================
-// 🟢 0. نافذة الفحص (للتأكد أن المحرك يعمل) - مفتوحة للجميع
+// 🟢 0. نافذة الفحص (للتأكد أن المحرك يعمل)
 // =================================================================
 app.get('/api/status', (req, res) => {
     res.json({ 
@@ -56,7 +55,7 @@ app.get('/api/status', (req, res) => {
 });
 
 // =================================================================
-// 🔑 1. نافذة تسجيل الدخول (Login) - مفتوحة للجميع لإصدار التذكرة
+// 🔑 1. نافذة تسجيل الدخول (Login)
 // =================================================================
 app.post('/api/login', async (req, res) => {
     const { phone, password } = req.body;
@@ -75,13 +74,11 @@ app.post('/api/login', async (req, res) => {
             return res.status(403).json({ success: false, message: "⛔ حسابك مجمد، يرجى مراجعة الإدارة." });
         }
 
-        // مطابقة كلمة المرور المشفرة
         const validPassword = await bcrypt.compare(password, user.password_hash);
         if (!validPassword) {
             return res.status(401).json({ success: false, message: "❌ كلمة المرور غير صحيحة." });
         }
 
-        // إصدار التذكرة (JWT)
         const token = jwt.sign(
             { id: user.id, role: user.role, phone: user.phone },
             JWT_SECRET,
@@ -110,7 +107,6 @@ app.post('/api/agents', authenticateToken, async (req, res) => {
     try {
         await pool.query('BEGIN');
 
-        // تشفير كلمة المرور قبل حفظها في قاعدة البيانات (خطوة أمنية هامة)
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const insertUserQuery = `
@@ -161,7 +157,6 @@ app.post('/api/finance/topup', authenticateToken, async (req, res) => {
     try {
         await pool.query('BEGIN');
 
-        // جلب الرصيد الحالي وتجميده للحظات حتى تنتهي العملية (FOR UPDATE)
         const getWalletQuery = `SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE;`;
         const walletResult = await pool.query(getWalletQuery, [agent_id]);
         
@@ -170,16 +165,13 @@ app.post('/api/finance/topup', authenticateToken, async (req, res) => {
         const previousBalance = parseFloat(walletResult.rows[0].balance);
         const newBalance = previousBalance + parseFloat(amount);
 
-        // تحديث الرصيد
         const updateWalletQuery = `UPDATE wallets SET balance = $1 WHERE user_id = $2;`;
         await pool.query(updateWalletQuery, [newBalance, agent_id]);
 
-        // التسجيل في السجل الأسود (من قام بالعملية؟ نأخذ رقمه من req.user.id الذي وفره الحارس)
         const insertLogQuery = `
             INSERT INTO transactions (user_id, type, amount, previous_balance, new_balance, description)
             VALUES ($1, 'deposit', $2, $3, $4, $5);
         `;
-        // نمرر agent_id كصاحب المحفظة الذي تمت عليه الحركة
         await pool.query(insertLogQuery, [agent_id, amount, previousBalance, newBalance, description]);
 
         await pool.query('COMMIT');
@@ -192,7 +184,64 @@ app.post('/api/finance/topup', authenticateToken, async (req, res) => {
 });
 
 // =================================================================
-// 🚀 تشغيل المحرك على البورت المخصص
+// 🤖 5. الروبوت الآلي (الخصم التلقائي للاشتراكات)
+// =================================================================
+// يعمل يومياً الساعة 12:00 منتصف الليل
+cron.schedule('0 0 * * *', async () => {
+    console.log("🤖 الروبوت الآلي بدأ العمل: فحص اشتراكات الوكلاء...");
+
+    try {
+        await pool.query('BEGIN');
+
+        const expiredSubsQuery = `
+            SELECT s.id as sub_id, s.agent_id, s.plan_name, w.balance, u.full_name 
+            FROM subscriptions s
+            JOIN wallets w ON s.agent_id = w.user_id
+            JOIN users u ON s.agent_id = u.id
+            WHERE s.end_date <= CURRENT_TIMESTAMP AND s.status = 'active';
+        `;
+        const { rows: expiredSubs } = await pool.query(expiredSubsQuery);
+
+        for (const sub of expiredSubs) {
+            const renewalCost = 5000.00; // قيمة التجديد الافتراضية
+
+            if (sub.balance >= renewalCost) {
+                // خصم وتجديد
+                const newBalance = parseFloat(sub.balance) - renewalCost;
+                
+                await pool.query(`UPDATE wallets SET balance = $1 WHERE user_id = $2`, [newBalance, sub.agent_id]);
+                
+                await pool.query(`
+                    INSERT INTO transactions (user_id, type, amount, previous_balance, new_balance, description)
+                    VALUES ($1, 'auto_deduction', $2, $3, $4, $5)
+                `, [sub.agent_id, -renewalCost, sub.balance, newBalance, `تجديد آلي لاشتراك: ${sub.plan_name}`]);
+
+                await pool.query(`
+                    UPDATE subscriptions 
+                    SET start_date = CURRENT_TIMESTAMP, 
+                        end_date = CURRENT_TIMESTAMP + INTERVAL '1 month' 
+                    WHERE id = $1
+                `, [sub.sub_id]);
+
+                console.log(`✅ تم التجديد الآلي للوكيل: ${sub.full_name}`);
+            } else {
+                // تجميد لعدم وجود رصيد
+                await pool.query(`UPDATE users SET status = 'frozen' WHERE id = $1`, [sub.agent_id]);
+                await pool.query(`UPDATE subscriptions SET status = 'expired' WHERE id = $1`, [sub.sub_id]);
+                console.log(`⛔ تم تجميد الوكيل لعدم وجود رصيد كافٍ: ${sub.full_name}`);
+            }
+        }
+
+        await pool.query('COMMIT');
+        console.log("🤖 انتهت مهمة الروبوت الآلي بنجاح.");
+    } catch (error) {
+        await pool.query('ROLLBACK');
+        console.error("❌ خطأ أثناء عمل الروبوت الآلي:", error);
+    }
+});
+
+// =================================================================
+// 🚀 6. تشغيل المحرك على البورت المخصص
 // =================================================================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
